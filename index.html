@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-    <title>Grocery Shop Manager</title>
+    <title>Grocery Shop Manager (Advanced)</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://unpkg.com/html5-qrcode"></script>
     <style>
@@ -62,10 +62,10 @@
         .close-btn {background:none;border:none;font-size:24px;cursor:pointer;color:var(--dark);}
         .scanner-container {width:100%;height:360px;background-color:#f0f0f0;display:flex;justify-content:center;align-items:center;margin-bottom:10px;position:relative;overflow:hidden;border-radius:6px;}
         .scanner-overlay {position:absolute;top:0;left:0;width:100%;height:100%;box-sizing:border-box;pointer-events:none;}
+        .low-stock {color:var(--danger);font-weight:700;}
+        .low-stock-row {background-color:#fff0f0;}
+        .settings-inline {display:flex;gap:10px;align-items:center;}
         @media print {body * {visibility:hidden;} .invoice-container, .invoice-container * {visibility:visible;} .invoice-container {position:absolute;left:0;top:0;width:100%;} .no-print {display:none !important;}}
-        .stock-update-form {display:flex;gap:10px;margin-top:10px;}
-        .stock-update-form input {flex:1;}
-        /* small mobile tweaks */
         @media (max-width:600px) {
             .header-content {flex-direction:column;align-items:flex-start;}
             .nav {margin-top:10px;flex-wrap:wrap;}
@@ -81,6 +81,7 @@
                 <li class="nav-item active" data-page="inventory">Inventory</li>
                 <li class="nav-item" data-page="pos">Point of Sale</li>
                 <li class="nav-item" data-page="sales">Sales History</li>
+                <li class="nav-item" data-page="reports">Reports</li>
             </ul>
         </div>
     </header>
@@ -106,7 +107,12 @@
                 </div>
 
                 <div class="form-group">
-                    <label for="product-price">Price ($)</label>
+                    <label for="product-purchase-price">Purchase Price (cost)</label>
+                    <input type="number" id="product-purchase-price" min="0" step="0.01" required>
+                </div>
+
+                <div class="form-group">
+                    <label for="product-price">Selling Price</label>
                     <input type="number" id="product-price" min="0" step="0.01" required>
                 </div>
 
@@ -118,13 +124,24 @@
                 <button type="submit">Add Product</button>
             </form>
 
-            <h3 style="margin-top: 30px;">Current Inventory</h3>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-top:18px;">
+                <h3>Current Inventory</h3>
+                <div class="settings-inline">
+                    <label for="low-stock-threshold">Low stock threshold:</label>
+                    <input type="number" id="low-stock-threshold" min="0" style="width:90px;" />
+                    <button id="save-threshold" class="success">Save</button>
+                </div>
+            </div>
+
+            <div id="low-stock-banner"></div>
+
             <table id="inventory-table">
                 <thead>
                     <tr>
                         <th>Name</th>
                         <th>Barcode</th>
-                        <th>Price</th>
+                        <th>Purchase Price</th>
+                        <th>Selling Price</th>
                         <th>Quantity</th>
                         <th>Actions</th>
                     </tr>
@@ -175,6 +192,18 @@
             <h2 class="page-title">Sales History</h2>
             <div id="sales-list"></div>
         </div>
+
+        <!-- Reports Page -->
+        <div id="reports" class="page">
+            <h2 class="page-title">Reports</h2>
+            <div class="form-group" style="max-width:360px;">
+                <label for="report-date">Select Date</label>
+                <input type="date" id="report-date">
+            </div>
+            <button id="generate-report" class="success">Generate Report</button>
+
+            <div id="report-output" style="margin-top:20px;"></div>
+        </div>
     </div>
 
     <!-- Barcode Scanner Modal (shared for inventory & POS) -->
@@ -186,7 +215,6 @@
             </div>
             <div id="scanner-container" class="scanner-container">
                 <div class="scanner-overlay"></div>
-                <!-- html5-qrcode will inject camera view here -->
             </div>
             <p style="text-align: center;">Point the barcode at the camera</p>
             <div class="form-group">
@@ -248,6 +276,7 @@
             </div>
             <div class="invoice-total">
                 <p>Total: <span id="invoice-total-amount"></span></p>
+                <p>Profit: <span id="invoice-total-profit"></span></p>
             </div>
             <div style="text-align: center; margin-top: 30px;">
                 <p>Thank you for your business!</p>
@@ -262,10 +291,23 @@
         let currentCart = [];
         let currentProductId = null;
 
+        // low stock threshold
+        let lowStockThreshold = parseInt(localStorage.getItem('lowStockThreshold')) || 5;
+
+        // migrate old inventory items that used 'price' to 'sellingPrice' and set purchasePrice default to 0
+        inventory = inventory.map(p => {
+            if (p.price !== undefined && p.sellingPrice === undefined) {
+                p.sellingPrice = p.price;
+                delete p.price;
+            }
+            if (p.purchasePrice === undefined) p.purchasePrice = 0;
+            if (p.quantity === undefined) p.quantity = (p.stock !== undefined ? p.stock : 0);
+            return p;
+        });
+
         // Scanner state
         let html5QrCode = null;
         let scannerActive = false;
-        // 'inventory' or 'pos' mode defines what we do on decode
         let scannerMode = 'inventory';
 
         // Elements
@@ -275,6 +317,9 @@
         const updateStockModal = document.getElementById('update-stock-modal');
 
         document.addEventListener('DOMContentLoaded', function() {
+            // initialize threshold input
+            document.getElementById('low-stock-threshold').value = lowStockThreshold;
+
             // Navigation
             navItems.forEach(item => {
                 item.addEventListener('click', function() {
@@ -285,8 +330,13 @@
                     document.getElementById(pageId).classList.add('active');
                     if (pageId === 'sales') displaySalesHistory();
                     if (pageId === 'pos') {
-                        // focus barcode input for convenience
                         setTimeout(() => { document.getElementById('barcode-input').focus(); }, 120);
+                    }
+                    if (pageId === 'reports') {
+                        // default report date to today
+                        const today = new Date().toISOString().slice(0,10);
+                        document.getElementById('report-date').value = today;
+                        generateReportForDate(today);
                     }
                 });
             });
@@ -299,16 +349,17 @@
                 e.preventDefault();
                 const name = document.getElementById('product-name').value.trim();
                 const barcode = document.getElementById('product-barcode').value.trim();
-                const price = parseFloat(document.getElementById('product-price').value);
+                const purchasePrice = parseFloat(document.getElementById('product-purchase-price').value);
+                const sellingPrice = parseFloat(document.getElementById('product-price').value);
                 const quantity = parseInt(document.getElementById('product-quantity').value);
-                if (!name || !barcode || isNaN(price)) {
+                if (!name || !barcode || isNaN(sellingPrice) || isNaN(purchasePrice)) {
                     showAlert('inventory-alert','Please fill required fields!','danger'); return;
                 }
                 if (inventory.some(product => product.barcode === barcode)) {
                     showAlert('inventory-alert','Product with this barcode already exists!','danger');
                     return;
                 }
-                addProductToInventory(name, barcode, price, quantity);
+                addProductToInventory(name, barcode, purchasePrice, sellingPrice, quantity);
                 this.reset();
                 document.getElementById('product-quantity').value = 1;
                 showAlert('inventory-alert','Product added successfully!','success');
@@ -378,6 +429,31 @@
                     showAlert('inventory-alert','Stock updated successfully!','success');
                 }
             });
+
+            document.getElementById('search-barcode').addEventListener('click', function() {
+                const barcode = document.getElementById('barcode-input').value.trim();
+                if (!barcode) return;
+                addProductToCartByBarcode(barcode);
+                document.getElementById('barcode-input').value = '';
+                document.getElementById('barcode-input').focus();
+            });
+
+            document.getElementById('save-threshold').addEventListener('click', function() {
+                const val = parseInt(document.getElementById('low-stock-threshold').value) || 0;
+                lowStockThreshold = val;
+                localStorage.setItem('lowStockThreshold', String(lowStockThreshold));
+                displayInventory();
+                showAlert('inventory-alert','Low stock threshold saved.','success');
+            });
+
+            document.getElementById('generate-report').addEventListener('click', function() {
+                const dateVal = document.getElementById('report-date').value;
+                if (!dateVal) { showAlert('inventory-alert','Please select a date.','danger'); return; }
+                generateReportForDate(dateVal);
+            });
+
+            // initial low stock check banner
+            displayLowStockBanner();
         });
 
         // Scanner modal control
@@ -396,7 +472,6 @@
             const scannerDivId = "scanner-container";
             html5QrCode = new Html5Qrcode(scannerDivId, /* verbose= */ false);
             const config = { fps: 10, qrbox: function(viewfinderWidth, viewfinderHeight) {
-                // make qrbox a square centered and size ~70% of smallest dimension
                 const minDim = Math.min(viewfinderWidth, viewfinderHeight);
                 const size = Math.floor(minDim * 0.7);
                 return { width: size, height: size };
@@ -404,32 +479,23 @@
 
             try {
                 await html5QrCode.start(
-                    { facingMode: { exact: "environment" } }, // prefer back camera
+                    { facingMode: { exact: "environment" } },
                     config,
                     (decodedText, decodedResult) => {
-                        // On successful decode
                         if (!decodedText) return;
-                        // Fill manual field so user can edit if needed
                         document.getElementById('manual-barcode').value = decodedText;
-                        // Behavior based on scanner mode
                         if (scannerMode === 'inventory') {
                             document.getElementById('product-barcode').value = decodedText;
                             showAlert('inventory-alert','Barcode scanned and filled.','success');
                         } else {
-                            // pos mode: add to cart
                             addProductToCartByBarcode(decodedText);
                         }
-                        // stop scanner and close modal after small delay
                         setTimeout(() => { closeScannerModal(); }, 400);
                     },
-                    (errorMessage) => {
-                        // decode error callbacks — ignore silently or we could show small indicator
-                        // console.debug("scan error", errorMessage);
-                    }
+                    (errorMessage) => {}
                 );
                 scannerActive = true;
             } catch (err) {
-                // try a more permissive camera constraint if exact fails (some devices)
                 try {
                     await html5QrCode.start(
                         { facingMode: "environment" },
@@ -461,7 +527,6 @@
                 await html5QrCode.stop();
                 await html5QrCode.clear();
             } catch (err) {
-                // ignore stop errors
                 console.warn('Stop error', err);
             }
             html5QrCode = null;
@@ -473,17 +538,23 @@
             const inventoryList = document.getElementById('inventory-list');
             inventoryList.innerHTML = '';
             if (inventory.length === 0) {
-                inventoryList.innerHTML = '<tr><td colspan="5" style="text-align: center;">No products in inventory</td></tr>';
+                inventoryList.innerHTML = '<tr><td colspan="6" style="text-align: center;">No products in inventory</td></tr>';
+                displayLowStockBanner();
                 return;
             }
             inventory.forEach(product => {
+                const isLow = product.quantity <= lowStockThreshold;
                 const row = document.createElement('tr');
+                if (isLow) row.classList.add('low-stock-row');
                 row.innerHTML = `
-                    <td>${product.name}</td>
+                    <td>${product.name} ${isLow ? '<span class="low-stock">⚠ Low</span>' : ''}</td>
                     <td>${product.barcode}</td>
-                    <td>$${product.price.toFixed(2)}</td>
+                    <td>$${Number(product.purchasePrice || 0).toFixed(2)}</td>
+                    <td>$${Number(product.sellingPrice || 0).toFixed(2)}</td>
                     <td>${product.quantity}</td>
-                    <td><button class="action-btn success update-stock-btn" data-id="${product.id}"><i class="fas fa-edit"></i> Update Stock</button></td>`;
+                    <td>
+                        <button class="action-btn success update-stock-btn" data-id="${product.id}"><i class="fas fa-edit"></i> Update Stock</button>
+                    </td>`;
                 inventoryList.appendChild(row);
             });
             document.querySelectorAll('.update-stock-btn').forEach(btn => {
@@ -498,27 +569,31 @@
                     }
                 });
             });
+            displayLowStockBanner();
+        }
+
+        function displayLowStockBanner() {
+            const banner = document.getElementById('low-stock-banner');
+            const lowItems = inventory.filter(i => i.quantity <= lowStockThreshold);
+            if (lowItems.length === 0) {
+                banner.innerHTML = '';
+                return;
+            }
+            const names = lowItems.map(i => `${i.name} (${i.quantity})`).join(', ');
+            banner.innerHTML = `<div class="alert alert-danger">Low stock alert: ${names}</div>`;
         }
 
         // POS setup
         function setupPOS() {
             const barcodeInput = document.getElementById('barcode-input');
             const searchBarcodeBtn = document.getElementById('search-barcode');
-            // Add item by typing barcode
-            searchBarcodeBtn.addEventListener('click', function() {
-                const barcode = barcodeInput.value.trim();
-                if (!barcode) { return; }
-                addProductToCartByBarcode(barcode);
-                barcodeInput.value = '';
-                barcodeInput.focus();
-            });
             barcodeInput.addEventListener('keypress', function(e) {
                 if (e.key === 'Enter') { e.preventDefault(); searchBarcodeBtn.click(); }
             });
         }
 
-        function addProductToInventory(name, barcode, price, quantity) {
-            const newProduct = {id: Date.now(), name, barcode, price, quantity};
+        function addProductToInventory(name, barcode, purchasePrice, sellingPrice, quantity) {
+            const newProduct = {id: Date.now(), name, barcode, purchasePrice, sellingPrice, quantity};
             inventory.push(newProduct);
             saveInventory();
             displayInventory();
@@ -532,7 +607,7 @@
             if (existingItem) {
                 if (existingItem.quantity < product.quantity) existingItem.quantity++;
                 else { showAlert('pos-alert','Not enough stock!', 'danger'); return; }
-            } else currentCart.push({id: product.id, name: product.name, barcode: product.barcode, price: product.price, quantity: 1});
+            } else currentCart.push({id: product.id, name: product.name, barcode: product.barcode, price: product.sellingPrice, purchasePrice: product.purchasePrice, quantity: 1});
             updateCartDisplay();
             showAlert('pos-alert','Product added to cart!', 'success');
         }
@@ -583,10 +658,28 @@
         }
 
         function completeSale() {
-            const sale = {id: Date.now(), date: new Date().toISOString(), items: [...currentCart], total: calculateCartTotal()};
+            // compute per-item profit and sale totalProfit
+            let totalProfit = 0;
+            currentCart.forEach(item => {
+                const profitPerItem = (Number(item.price) - Number(item.purchasePrice || 0));
+                item.profit = profitPerItem * item.quantity;
+                totalProfit += item.profit;
+            });
+            const sale = {
+                id: Date.now(),
+                date: new Date().toISOString(),
+                dateString: new Date().toLocaleDateString(),
+                items: JSON.parse(JSON.stringify(currentCart)),
+                total: calculateCartTotal(),
+                totalProfit: totalProfit
+            };
+            // reduce inventory
             currentCart.forEach(cartItem => {
                 const inventoryItem = inventory.find(item => item.id === cartItem.id);
-                if (inventoryItem) inventoryItem.quantity -= cartItem.quantity;
+                if (inventoryItem) {
+                    inventoryItem.quantity -= cartItem.quantity;
+                    if (inventoryItem.quantity < 0) inventoryItem.quantity = 0;
+                }
             });
             saveInventory();
             sales.push(sale);
@@ -611,22 +704,16 @@
                 invoiceItemsList.appendChild(row);
             });
             document.getElementById('invoice-total-amount').textContent = `$${sale.total.toFixed(2)}`;
+            document.getElementById('invoice-total-profit').textContent = `$${sale.totalProfit.toFixed(2)}`;
             const invoiceContent = document.getElementById('invoice-template').innerHTML;
             const originalContent = document.body.innerHTML;
             document.body.innerHTML = invoiceContent;
             window.print();
             document.body.innerHTML = originalContent;
-            // Rebind navigation after restoring body
-            document.querySelectorAll('.nav-item').forEach(item => item.addEventListener('click', function() {
-                const pageId = this.getAttribute('data-page');
-                document.querySelectorAll('.nav-item').forEach(nav => nav.classList.remove('active'));
-                this.classList.add('active');
-                document.querySelectorAll('.page').forEach(page => page.classList.remove('active'));
-                document.getElementById(pageId).classList.add('active');
-                if (pageId === 'sales') displaySalesHistory();
-            }));
-            // set active nav to inventory by default
-            document.querySelector('.nav-item.active').click();
+            // rebind nav and events after restore
+            setTimeout(() => {
+                location.reload(); // quick and safe way to restore event bindings and state
+            }, 10);
         }
 
         function displaySalesHistory() {
@@ -641,27 +728,63 @@
                 saleElement.style.marginBottom = '20px';
                 let itemsHTML = '';
                 sale.items.forEach(item => {
-                    itemsHTML += `<tr><td>${item.name}</td><td>$${item.price.toFixed(2)}</td><td>${item.quantity}</td><td>$${(item.price * item.quantity).toFixed(2)}</td></tr>`;
+                    itemsHTML += `<tr><td>${item.name}</td><td>$${item.price.toFixed(2)}</td><td>${item.quantity}</td><td>$${(item.price * item.quantity).toFixed(2)}</td><td>${item.profit ? ('$' + item.profit.toFixed(2)) : '-'}</td></tr>`;
                 });
                 saleElement.innerHTML = `
                     <h3>Sale #${sale.id} - ${saleDate}</h3>
                     <table>
-                        <thead><tr><th>Product</th><th>Price</th><th>Qty</th><th>Total</th></tr></thead>
+                        <thead><tr><th>Product</th><th>Price</th><th>Qty</th><th>Total</th><th>Profit</th></tr></thead>
                         <tbody>${itemsHTML}</tbody>
-                        <tfoot><tr><td colspan="3" style="text-align:right;font-weight:bold;">Total:</td><td>$${sale.total.toFixed(2)}</td></tr></tfoot>
-                    </table>`;
+                        <tfoot><tr><td colspan="4" style="text-align:right;font-weight:bold;">Total:</td><td>$${sale.total.toFixed(2)}</td></tr></tfoot>
+                    </table>
+                    <p style="text-align:right;font-weight:bold;">Sale Profit: $${(sale.totalProfit || 0).toFixed(2)}</p>`;
                 salesList.appendChild(saleElement);
             });
         }
 
         function saveInventory() { localStorage.setItem('inventory', JSON.stringify(inventory)); }
 
+        // Reports
+        function generateReportForDate(dateISO) {
+            // dateISO is yyyy-mm-dd from input[type=date]
+            const target = (new Date(dateISO)).toLocaleDateString();
+            const relevantSales = sales.filter(s => s.dateString === target);
+            let totalRevenue = 0, totalProfit = 0, totalLoss = 0;
+            let rows = '';
+            relevantSales.forEach(sale => {
+                totalRevenue += Number(sale.total || 0);
+                totalProfit += Number(sale.totalProfit || 0);
+                if (sale.totalProfit < 0) totalLoss += Math.abs(Number(sale.totalProfit));
+                rows += `<div class="invoice-container" style="margin-bottom:12px;">
+                    <h4>Sale #${sale.id} - ${new Date(sale.date).toLocaleTimeString()}</h4>
+                    <table>
+                        <thead><tr><th>Product</th><th>Price</th><th>Qty</th><th>Total</th><th>Profit</th></tr></thead>
+                        <tbody>`;
+                sale.items.forEach(it => {
+                    rows += `<tr><td>${it.name}</td><td>$${it.price.toFixed(2)}</td><td>${it.quantity}</td><td>$${(it.price*it.quantity).toFixed(2)}</td><td>$${(it.profit || 0).toFixed(2)}</td></tr>`;
+                });
+                rows += `</tbody><tfoot><tr><td colspan="4" style="text-align:right;font-weight:bold;">Sale Total:</td><td>$${sale.total.toFixed(2)}</td></tr></tfoot></table>
+                    <p style="text-align:right;font-weight:bold;">Sale Profit: $${(sale.totalProfit||0).toFixed(2)}</p></div>`;
+            });
+            const output = document.getElementById('report-output');
+            output.innerHTML = `
+                <div class="invoice-container">
+                    <h3>Report for ${target}</h3>
+                    <p><strong>Total Revenue:</strong> $${totalRevenue.toFixed(2)}</p>
+                    <p><strong>Total Profit:</strong> $${totalProfit.toFixed(2)}</p>
+                    <p><strong>Total Loss:</strong> $${totalLoss.toFixed(2)}</p>
+                </div>
+                <h3 style="margin-top:12px;">Sales Details</h3>
+                ${rows || '<p>No sales on this date.</p>'}
+            `;
+        }
+
         // Alert helper
         function showAlert(containerId, message, type) {
             const alertContainer = document.getElementById(containerId);
             if (!alertContainer) return;
             alertContainer.innerHTML = `<div class="alert alert-${type}">${message}</div>`;
-            setTimeout(() => { if (alertContainer) alertContainer.innerHTML = ''; }, 3000);
+            setTimeout(() => { if (alertContainer) alertContainer.innerHTML = ''; }, 3500);
         }
     </script>
 </body>
